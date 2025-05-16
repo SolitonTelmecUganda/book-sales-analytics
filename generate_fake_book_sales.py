@@ -19,8 +19,8 @@ books_file = os.path.join(output_dir, "books.csv")
 sales_file = os.path.join(output_dir, "sales.csv")
 
 # Constants
-NUM_BOOKS = 500  # Generate 500 unique books
-NUM_SALES = 10000  # Generate 10,000 sales transactions
+NUM_BOOKS = 5000  # Generate 500 unique books
+NUM_SALES = 10000000  # Generate 10,000 sales transactions
 
 # Book categories/genres
 book_genres = [
