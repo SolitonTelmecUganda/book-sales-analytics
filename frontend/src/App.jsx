@@ -2,6 +2,7 @@
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import DashboardLayout from './layouts/DashboardLayout';
 import Dashboard from './pages/Dashboard';
+import DashboardOptimized from './pages/DashboardOptimized';
 import TopBooks from './pages/TopBooks';
 import SalesByRegion from './pages/SalesByRegion';
 import SalesByGenre from './pages/SalesByGenre';
@@ -20,6 +21,11 @@ function App() {
             <Route index element={
               <ErrorBoundary fallbackMessage="Error loading dashboard">
                 <Dashboard />
+              </ErrorBoundary>
+            } />
+            <Route path="dashboard" element={
+              <ErrorBoundary fallbackMessage="Error loading dashboard">
+                <DashboardOptimized />
               </ErrorBoundary>
             } />
             <Route path="top-books" element={
