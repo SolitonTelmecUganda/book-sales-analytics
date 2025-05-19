@@ -1,7 +1,10 @@
 # api/views.py
+import time
+
 import pandas as pd
 import redshift_connector
 from django.conf import settings
+from django.core.cache import cache
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
@@ -17,15 +20,19 @@ class RedshiftAPIView(APIView):
 
     def get_redshift_connection(self):
         """Get connection to Redshift"""
-        conn = redshift_connector.connect(
-            host=settings.REDSHIFT_HOST,
-            database=settings.REDSHIFT_DB,
-            user=settings.REDSHIFT_USER,
-            password=settings.REDSHIFT_PASSWORD,
-            port=settings.REDSHIFT_PORT
-        )
-        conn.autocommit = True
-        return conn
+        try:
+            conn = redshift_connector.connect(
+                host=settings.REDSHIFT_HOST,
+                database=settings.REDSHIFT_DB,
+                user=settings.REDSHIFT_USER,
+                password=settings.REDSHIFT_PASSWORD,
+                port=settings.REDSHIFT_PORT
+            )
+            conn.autocommit = True
+            return conn
+        except redshift_connector.Error as e:
+            print(f"Error connecting to Redshift: {e}")
+            raise
 
     def execute_query(self, query, params=None):
         """Execute query on Redshift and return as DataFrame"""
@@ -297,3 +304,272 @@ def generate_test_data(request):
             {"error": str(e)},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+
+class OptimizedSalesTimeSeriesView(APIView):
+    """Optimized view for time series data with improved performance for large date ranges."""
+
+    def get(self, request):
+        start_time = time.time()
+
+        # Get query parameters
+        interval = request.query_params.get('interval', 'auto')
+        days = int(request.query_params.get('days', 30))
+
+        # Cache key based on parameters
+        cache_key = f"sales_timeseries_{interval}_{days}"
+        cached_data = cache.get(cache_key)
+
+        if cached_data:
+            # Add processing time info
+            processing_info = {
+                "cached": True,
+                "processing_time_ms": round((time.time() - start_time) * 1000)
+            }
+            cached_data["processing_info"] = processing_info
+            return Response(cached_data)
+
+        # Determine appropriate time granularity based on the time range
+        if interval == 'auto':
+            if days <= 30:
+                interval = 'day'
+            elif days <= 90:
+                interval = 'week'
+            elif days <= 365:
+                interval = 'month'
+            else:
+                interval = 'quarter'
+
+        # Validate interval
+        valid_intervals = ['day', 'week', 'month', 'quarter', 'year']
+        if interval not in valid_intervals:
+            return Response(
+                {"error": f"Invalid interval. Must be one of: {', '.join(valid_intervals)} or 'auto'"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Set a max limit for raw data points to return
+        max_data_points = 100
+
+        # Use appropriate query based on the time period for optimal performance
+        if days <= 90:
+            # For smaller date ranges, use the detailed sales_by_day view
+            df = self._query_daily_sales(days, interval)
+        else:
+            # For larger date ranges, use the pre-aggregated views
+            df = self._query_aggregated_sales(days, interval, max_data_points)
+
+        if df.empty:
+            return Response({"error": "No data available for the specified time range"},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        # Convert to JSON-friendly format with proper data types
+        result = self._prepare_response(df, interval)
+
+        # Add processing time information
+        processing_time = time.time() - start_time
+        result["processing_info"] = {
+            "cached": False,
+            "interval_used": interval,
+            "data_points": len(result["period"]),
+            "processing_time_ms": round(processing_time * 1000)
+        }
+
+        # Cache the result (adjust timeout based on time range)
+        cache_timeout = min(days * 60, 86400)  # Cache longer for bigger ranges, max 24 hours
+        cache.set(cache_key, result, cache_timeout)
+
+        return Response(result)
+
+    def _query_daily_sales(self, days, interval):
+        """Query daily sales from the sales_by_day view for smaller time ranges."""
+        conn = self._get_redshift_connection()
+        cursor = conn.cursor()
+
+        try:
+            # Use the pre-aggregated view for faster queries
+            query = f"""
+            SELECT 
+                DATE_TRUNC('{interval}', day)::DATE AS period,
+                SUM(num_sales) AS num_sales,
+                SUM(total_books_sold) AS books_sold,
+                SUM(total_revenue) AS revenue
+            FROM analytics.sales_by_day
+            WHERE day >= CURRENT_DATE - INTERVAL '%s days'
+            GROUP BY DATE_TRUNC('{interval}', day)::DATE
+            ORDER BY period
+            """
+
+            cursor.execute(query, [days])
+
+            # Get column names
+            columns = [desc[0] for desc in cursor.description]
+
+            # Fetch all rows
+            rows = cursor.fetchall()
+
+            # Create DataFrame
+            df = pd.DataFrame(rows, columns=columns)
+
+            return df
+        finally:
+            cursor.close()
+            conn.close()
+
+    def _query_aggregated_sales(self, days, interval, max_points):
+        """Query pre-aggregated sales data for larger time ranges."""
+        conn = self._get_redshift_connection()
+        cursor = conn.cursor()
+
+        try:
+            # For large time periods, first check if we should use the monthly_sales view
+            if interval in ['month', 'quarter', 'year']:
+                # Use monthly_sales view which is pre-aggregated
+                query = f"""
+                SELECT 
+                    DATE_TRUNC('{interval}', month)::DATE AS period,
+                    SUM(num_sales) AS num_sales,
+                    SUM(total_books_sold) AS books_sold,
+                    SUM(total_revenue) AS revenue
+                FROM analytics.monthly_sales
+                WHERE month >= CURRENT_DATE - INTERVAL '%s days'
+                GROUP BY DATE_TRUNC('{interval}', month)::DATE
+                ORDER BY period
+                """
+            else:
+                # For custom intervals or if we need to downsample, use this approach
+                # First determine how many days to aggregate per point to stay under max_points
+                bucket_size = max(1, days // max_points)
+
+                query = f"""
+                WITH date_series AS (
+                    SELECT
+                        CURRENT_DATE - (n || ' days')::INTERVAL AS day
+                    FROM generate_series(0, %s) n
+                ),
+                bucketed_dates AS (
+                    SELECT
+                        -- Create buckets of days
+                        CURRENT_DATE - ((n/{bucket_size}) * {bucket_size} || ' days')::INTERVAL AS period
+                    FROM generate_series(0, %s) n
+                ),
+                aggregated AS (
+                    SELECT 
+                        bd.period,
+                        SUM(COALESCE(s.num_sales, 0)) AS num_sales,
+                        SUM(COALESCE(s.total_books_sold, 0)) AS books_sold,
+                        SUM(COALESCE(s.total_revenue, 0)) AS revenue
+                    FROM bucketed_dates bd
+                    LEFT JOIN analytics.sales_by_day s ON DATE_TRUNC('day', s.day) = DATE_TRUNC('day', bd.period)
+                    GROUP BY bd.period
+                    ORDER BY bd.period
+                )
+                SELECT * FROM aggregated
+                """
+
+                cursor.execute(query, [days, days])
+
+            # Get column names
+            columns = [desc[0] for desc in cursor.description]
+
+            # Fetch all rows
+            rows = cursor.fetchall()
+
+            # Create DataFrame
+            df = pd.DataFrame(rows, columns=columns)
+
+            return df
+        except Exception as e:
+            print(f"Error in _query_aggregated_sales: {str(e)}")
+            # Fallback to a simpler query if the above fails
+            try:
+                fallback_query = f"""
+                SELECT 
+                    DATE_TRUNC('{interval}', sale_date)::DATE AS period,
+                    COUNT(*) AS num_sales,
+                    SUM(quantity) AS books_sold,
+                    SUM(sale_amount) AS revenue
+                FROM analytics.fact_sales
+                WHERE sale_date >= CURRENT_DATE - INTERVAL '%s days'
+                GROUP BY DATE_TRUNC('{interval}', sale_date)::DATE
+                ORDER BY period
+                """
+
+                cursor.execute(fallback_query, [days])
+
+                # Get column names
+                columns = [desc[0] for desc in cursor.description]
+
+                # Fetch all rows
+                rows = cursor.fetchall()
+
+                # Create DataFrame
+                df = pd.DataFrame(rows, columns=columns)
+
+                return df
+            except Exception as fallback_error:
+                print(f"Fallback query also failed: {str(fallback_error)}")
+                return pd.DataFrame()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def _prepare_response(self, df, interval):
+        """Prepare the response data from the DataFrame."""
+        try:
+            # Convert period to datetime if it's not already
+            if df['period'].dtype != 'datetime64[ns]':
+                df['period'] = pd.to_datetime(df['period'])
+
+            # Format date based on interval
+            date_format = '%Y-%m-%d'  # Default format
+            if interval == 'month':
+                date_format = '%Y-%m'
+            elif interval == 'quarter':
+                # Custom handling for quarters
+                df['year'] = df['period'].dt.year
+                df['quarter'] = df['period'].dt.quarter
+                periods = [f"{year}-Q{quarter}" for year, quarter in zip(df['year'], df['quarter'])]
+
+                result = {
+                    'period': periods,
+                    'num_sales': df['num_sales'].fillna(0).astype(int).tolist(),
+                    'books_sold': df['books_sold'].fillna(0).astype(int).tolist(),
+                    'revenue': df['revenue'].fillna(0).astype(float).tolist()
+                }
+                return result
+            elif interval == 'year':
+                date_format = '%Y'
+
+            # Standard formatting for most intervals
+            result = {
+                'period': df['period'].dt.strftime(date_format).tolist(),
+                'num_sales': df['num_sales'].fillna(0).astype(int).tolist(),
+                'books_sold': df['books_sold'].fillna(0).astype(int).tolist(),
+                'revenue': df['revenue'].fillna(0).astype(float).tolist()
+            }
+            return result
+        except Exception as e:
+            print(f"Error in _prepare_response: {str(e)}")
+            # Fallback if date conversion fails
+            result = {
+                'period': [str(x) for x in df['period'].tolist()],
+                'num_sales': df['num_sales'].fillna(0).astype(int).tolist(),
+                'books_sold': df['books_sold'].fillna(0).astype(int).tolist(),
+                'revenue': df['revenue'].fillna(0).astype(float).tolist()
+            }
+            return result
+
+    def _get_redshift_connection(self):
+        """Get connection to Redshift."""
+        import redshift_connector
+
+        conn = redshift_connector.connect(
+            host=settings.REDSHIFT_HOST,
+            database=settings.REDSHIFT_DB,
+            user=settings.REDSHIFT_USER,
+            password=settings.REDSHIFT_PASSWORD,
+            port=settings.REDSHIFT_PORT
+        )
+        conn.autocommit = True
+        return conn
