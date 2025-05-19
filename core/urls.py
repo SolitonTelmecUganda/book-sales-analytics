@@ -6,7 +6,8 @@ from .views import (
     TopBooksView,
     SalesByRegionView,
     SalesByGenreView,
-    generate_test_data
+    generate_test_data,
+    OptimizedSalesTimeSeriesView
 )
 
 urlpatterns = [
@@ -16,4 +17,5 @@ urlpatterns = [
     path('analytics/sales-by-region/', SalesByRegionView.as_view(), name='sales-by-region'),
     path('analytics/sales-by-genre/', SalesByGenreView.as_view(), name='sales-by-genre'),
     path('analytics/generate-test-data/', generate_test_data, name='generate-test-data'),
+    path('analytics/optimized-timeseries/', OptimizedSalesTimeSeriesView.as_view(), name='optimized-sales-timeseries'),
 ]
